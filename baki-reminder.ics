@@ -1,0 +1,20 @@
+BEGIN:VCALENDAR
+VERSION:2.0
+PRODID:-//Grab Money//Weekly check-in//EN
+CALSCALE:GREGORIAN
+METHOD:PUBLISH
+BEGIN:VEVENT
+UID:grabmoney-weekly-checkin@local
+DTSTAMP:20261102T000000Z
+DTSTART;TZID=Asia/Kuala_Lumpur:20261104T200000
+RRULE:FREQ=WEEKLY;BYDAY=WE,SU
+DURATION:PT15M
+SUMMARY:Grab Money — log this week's driving
+DESCRIPTION:Upload your latest backup (.json) so the week's shifts and expenses get folded into the tracker. In the app: More → Download to make the backup.\n\nLast state: 0 entries / 0 shifts. Running cost RM0.232/km.
+BEGIN:VALARM
+TRIGGER:-PT10M
+ACTION:DISPLAY
+DESCRIPTION:Grab Money check-in in 10 minutes
+END:VALARM
+END:VEVENT
+END:VCALENDAR

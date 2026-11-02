@@ -1,0 +1,14 @@
+# --- local data (never publish) ---
+data.json
+data.json.tmp
+backups/
+
+# --- TLS material: private keys must never be committed ---
+tls/
+*.key
+*.crt
+*.srl
+
+# --- dev scratch ---
+shots/
+NEXT-SESSION.md
