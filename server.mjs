@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import zlib from 'node:zlib';
 /**
  * Baki sync server
  * ---------------------------------------------------------------
@@ -12,15 +13,17 @@
  * that file, or with More → Backup in the app.
  */
 import http from 'node:http';
+import dgram from 'node:dgram';
 import https from 'node:https';
-import { readFile, writeFile, rename, mkdir, readdir, unlink } from 'node:fs/promises';
+import { readFile, writeFile, rename, mkdir, readdir, unlink, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { networkInterfaces } from 'node:os';
+import { networkInterfaces, hostname } from 'node:os';
 import { extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(new URL('.', import.meta.url)));
 const DATA_FILE = process.env.DATA_FILE ? resolve(process.env.DATA_FILE) : join(ROOT, 'data.json');
+const ROUTES_FILE = process.env.ROUTES_FILE ? resolve(process.env.ROUTES_FILE) : join(ROOT, 'routes.json');
 const BACKUP_DIR = join(ROOT, 'backups');
 const KEEP_BACKUPS = 30;
 const PORT = Number(process.env.PORT || 8787);
@@ -58,6 +61,7 @@ function emptyData() {
     updatedAt: new Date().toISOString(),
     entries: [],
     shifts: [],
+    statements: {},
     settings: { name: '', cats: { in: [], out: [] }, profit: {} },
     tomb: { ids: [], cats: [] },
   };
@@ -80,6 +84,13 @@ function cleanShift(s) {
     kmPerLitre: Number(s.kmPerLitre) > 0 ? Number(s.kmPerLitre) : null,
     grabFee: s.grabFee == null ? null : Math.max(0, Math.round(Number(s.grabFee) || 0)),
     note: String(s.note || '').slice(0, 200),
+    // payout times: what lets the week review talk about idle stretches
+    ...(Array.isArray(s.payouts) && s.payouts.length ? {
+      payouts: s.payouts
+        .filter(p => p && Number.isFinite(Number(p.c)) && Number.isFinite(Number(p.at)))
+        .slice(0, 200)
+        .map(p => ({ c: Math.round(Number(p.c)), at: Number(p.at) })),
+    } : {}),
     ...(s.sample ? { sample: true } : {}),
     updated: String(s.updated || new Date().toISOString()),
   };
@@ -99,6 +110,21 @@ function cleanTomb(t) {
     ids: [...new Set((Array.isArray(raw.ids) ? raw.ids : []).map(String))].slice(-TOMB_MAX),
     cats: [...new Set((Array.isArray(raw.cats) ? raw.cats : []).map(String))].slice(-100),
   };
+}
+
+/* ---------- live change feed (Server-Sent Events) ----------
+ * One-way server -> clients: "the data changed, version is now X".
+ * Writes still go over POST /api/data, so this needs no framing, no
+ * handshake and no dependency — and EventSource reconnects by itself.
+ */
+const sseClients = new Set();
+
+function sseSend(res, event, payload) {
+  try { res.write(`event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`); }
+  catch (e) { sseClients.delete(res); }
+}
+function broadcastChange(meta) {
+  for (const res of sseClients) sseSend(res, 'change', meta);
 }
 
 async function load() {
@@ -126,6 +152,70 @@ async function load() {
  * deleted an entry tells the server to drop it everywhere, instead of
  * the entry being resurrected by an additive merge.
  */
+/** Imported Grab statements, keyed by the Monday they cover. Reference data only. */
+function cleanStatements(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object') return out;
+  for (const [week, st] of Object.entries(raw)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(week)) continue;
+    if (!st || typeof st !== 'object') continue;
+    const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? v : 0);
+    out[week] = {
+      week_start: week,
+      range_text: typeof st.range_text === 'string' ? st.range_text.slice(0, 80) : '',
+      income: num(st.income),
+      deductions: num(st.deductions),
+      weekly: num(st.weekly),
+      transport_net: num(st.transport_net),
+      pickup_fares: num(st.pickup_fares),
+      trip_fares: num(st.trip_fares),
+      other_income: num(st.other_income),
+      incentives: num(st.incentives),
+      tips: num(st.tips),
+      insurance_count: num(st.insurance_count),
+      consistent: !!st.consistent,
+      imported_at: typeof st.imported_at === 'string' ? st.imported_at : '',
+    };
+  }
+  return out;
+}
+
+function cleanBill(b) {
+  if (!b || typeof b !== 'object') return null;
+  if (typeof b.id !== 'string' || !b.id) return null;
+  if (typeof b.name !== 'string' || !b.name.trim()) return null;
+  if (!Number.isFinite(Number(b.amount)) || Number(b.amount) < 0) return null;
+  const cadence = b.cadence === 'annual' ? 'annual' : 'monthly';
+  const anchor = Number(b.anchorMonth);
+  return {
+    id: b.id.slice(0, 80),
+    name: b.name.slice(0, 60),
+    amount: Math.round(Number(b.amount)),
+    cadence,
+    category: typeof b.category === 'string' ? b.category.slice(0, 40) : 'other',
+    business: b.business === true,
+    optional: b.optional === true,
+    anchorMonth: Number.isInteger(anchor) && anchor >= 1 && anchor <= 12 ? anchor : null,
+    updated: typeof b.updated === 'string' ? b.updated : '',
+    active: b.active !== false,
+  };
+}
+
+function cleanBillPayment(p) {
+  if (!p || typeof p !== 'object') return null;
+  if (typeof p.billId !== 'string' || !p.billId) return null;
+  if (typeof p.period !== 'string' || !/^\d{4}(-\d{2})?$/.test(p.period)) return null;
+  if (typeof p.entryId !== 'string' || !p.entryId) return null;
+  return {
+    billId: p.billId.slice(0, 80),
+    period: p.period,
+    amount: Math.max(0, Math.round(Number(p.amount) || 0)),
+    entryId: p.entryId.slice(0, 80),
+    paidAt: typeof p.paidAt === 'string' ? p.paidAt : '',
+    updated: typeof p.updated === 'string' ? p.updated : '',
+  };
+}
+
 function mergeData(current, incoming, tombstones = {}) {
   const base = current && Array.isArray(current.entries) ? current : emptyData();
   const stored = cleanTomb(base.tomb);
@@ -152,11 +242,38 @@ function mergeData(current, incoming, tombstones = {}) {
     const cur = shiftById.get(x.id);
     if (!cur || String(x.updated || '') >= String(cur.updated || '')) shiftById.set(x.id, x);
   }
+  const statements = cleanStatements(incoming.statements || {});
+  for (const [week, st] of Object.entries(cleanStatements(base.statements || {}))) {
+    const cur = statements[week];
+    if (!cur || (st.imported_at || '') > (cur.imported_at || '')) statements[week] = st;
+  }
+  const billById = new Map();
+  for (const b of (base.bills || [])) { const c = cleanBill(b); if (c) billById.set(c.id, c); }
+  for (const b of (incoming.bills || [])) {
+    const c = cleanBill(b);
+    if (!c) continue;
+    const cur = billById.get(c.id);
+    if (!cur || c.updated >= cur.updated) billById.set(c.id, c);
+  }
+  const paymentByKey = new Map();
+  const putPayment = (p) => {
+    const c = cleanBillPayment(p);
+    if (!c) return;
+    const key = c.billId + '|' + c.period;
+    const cur = paymentByKey.get(key);
+    if (!cur || c.updated >= cur.updated) paymentByKey.set(key, c);
+  };
+  for (const p of (base.billPayments || [])) putPayment(p);
+  for (const p of (incoming.billPayments || [])) putPayment(p);
+
   return {
     v: 1,
     updatedAt: new Date().toISOString(),
     entries: [...byId.values()],
+    bills: [...billById.values()],
+    billPayments: [...paymentByKey.values()],
     shifts: [...shiftById.values()],
+    statements,
     settings: {
       name: (incoming.settings && incoming.settings.name) || (base.settings && base.settings.name) || '',
       cats: {
@@ -204,14 +321,66 @@ function save(data) {
   return writeQueue;
 }
 
-function json(res, code, obj) {
-  const body = JSON.stringify(obj);
-  res.writeHead(code, {
+
+/** The newest APK in dist-android, by modification time. */
+async function newestApk() {
+  const list = await apkList();
+  return list[0] || null;
+}
+
+async function apkList() {
+  const dir = join(ROOT, 'dist-android');
+  try {
+    const names = (await readdir(dir)).filter(n => n.endsWith('.apk'));
+    const rows = await Promise.all(names.map(async name => {
+      const st = await stat(join(dir, name));
+      return { name, size: st.size, mtime: st.mtimeMs, when: st.mtime.toISOString().slice(0, 16).replace('T', ' ') };
+    }));
+    return rows.sort((a, b) => b.mtime - a.mtime);
+  } catch {
+    return [];
+  }
+}
+
+function json(req, res, code, obj) {
+  const raw = JSON.stringify(obj);
+  // payloads are JSON and highly compressible; the client advertises gzip support
+  const acceptsGzip = String(req?.headers?.['accept-encoding'] || '').includes('gzip');
+  const body = acceptsGzip && raw.length > 1024 ? zlib.gzipSync(raw) : Buffer.from(raw);
+  const headers = {
     'content-type': 'application/json; charset=utf-8',
     'cache-control': 'no-store',
-    'content-length': Buffer.byteLength(body),
-  });
+    'content-length': body.length,
+    vary: 'accept-encoding',
+  };
+  if (acceptsGzip && raw.length > 1024) headers['content-encoding'] = 'gzip';
+  res.writeHead(code, headers);
   res.end(body);
+}
+
+/* ---------------------------------------------------------------- routes
+ * Opaque encrypted blobs, one per shift. The server never sees a coordinate: the phone seals the
+ * trace with a key only the two clients know, and the desk opens it again. Kept out of data.json so
+ * a ledger backup never drags a month of movement history with it.
+ */
+let routesCache = null;
+
+async function loadRoutes() {
+  if (routesCache) return routesCache;
+  try {
+    const parsed = JSON.parse(await readFile(ROUTES_FILE, 'utf8'));
+    routesCache = { v: 1, items: parsed && parsed.items ? parsed.items : {} };
+  } catch (e) {
+    routesCache = { v: 1, items: {} };
+  }
+  return routesCache;
+}
+
+async function saveRoutes(next) {
+  routesCache = next;
+  const tmp = ROUTES_FILE + '.tmp';
+  await writeFile(tmp, JSON.stringify(next), 'utf8');
+  await rename(tmp, ROUTES_FILE);
 }
 
 function readBody(req) {
@@ -228,10 +397,21 @@ function readBody(req) {
   });
 }
 
+function shutdown() {
+  try { if (beaconTimer) clearInterval(beaconTimer); } catch (e) {}
+  try { if (mdns) mdns.destroy(); } catch (e) {}
+  process.exit(0);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
+
 async function handle(req, res) {
   const url = new URL(req.url, 'http://' + (req.headers.host || 'localhost'));
   const path = decodeURIComponent(url.pathname);
   lastAccess = Date.now();
+  if (process.env.LOG_REQUESTS === '1') {
+    console.log(`[req] :${req.socket.localPort} ${req.method} ${path} from ${req.socket.remoteAddress} origin=${req.headers.origin||'-'} ua=${(req.headers['user-agent']||'').slice(0,28)}`);
+  }
 
   // CORS: allows the same HTML opened as a local file to talk to this server.
   res.setHeader('access-control-allow-origin', '*');
@@ -242,7 +422,7 @@ async function handle(req, res) {
   try {
     // The private CA certificate, so a phone can download and trust it.
     if (path === '/ca.crt') {
-      if (!existsSync(TLS_CA)) return json(res, 404, { ok: false, error: 'Run ./tools/setup-https.sh first' });
+      if (!existsSync(TLS_CA)) return json(req, res, 404, { ok: false, error: 'Run ./tools/setup-https.sh first' });
       const pem = await readFile(TLS_CA);
       res.writeHead(200, {
         'content-type': 'application/x-x509-ca-cert',
@@ -254,17 +434,37 @@ async function handle(req, res) {
 
     // Test-only reset. Disabled unless ALLOW_RESET=1, and only from this machine.
     if (path === '/api/reset') {
-      if (process.env.ALLOW_RESET !== '1') return json(res, 404, { ok: false, error: 'Not found' });
+      if (process.env.ALLOW_RESET !== '1') return json(req, res, 404, { ok: false, error: 'Not found' });
       const remote = req.socket.remoteAddress || '';
-      if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote)) return json(res, 403, { ok: false, error: 'Local only' });
-      if (req.method !== 'POST') return json(res, 405, { ok: false, error: 'Use POST' });
+      if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote)) return json(req, res, 403, { ok: false, error: 'Local only' });
+      if (req.method !== 'POST') return json(req, res, 405, { ok: false, error: 'Use POST' });
       await save(emptyData());
-      return json(res, 200, { ok: true });
+      broadcastChange({ version: cache.version, entries: 0, at: new Date().toISOString(), reset: true });
+      return json(req, res, 200, { ok: true });
+    }
+
+    if (path === '/api/events') {
+      if (req.method !== 'GET') return json(req, res, 405, { ok: false, error: 'Use GET' });
+      res.writeHead(200, {
+        'content-type': 'text/event-stream; charset=utf-8',
+        'cache-control': 'no-store, no-transform',
+        connection: 'keep-alive',
+        'x-accel-buffering': 'no',
+      });
+      res.write('retry: 3000\n\n');
+      sseClients.add(res);
+      const { version } = await load();
+      sseSend(res, 'hello', { version, at: new Date().toISOString() });
+      const keepalive = setInterval(() => { try { res.write(': keepalive\n\n'); } catch (e) { /* gone */ } }, 25000);
+      const done = () => { clearInterval(keepalive); sseClients.delete(res); };
+      req.on('close', done);
+      req.on('error', done);
+      return;
     }
 
     if (path === '/api/ping') {
       const { data, version } = await load();
-      return json(res, 200, {
+      return json(req, res, 200, {
         ok: true,
         app: 'grab-money',
         version,
@@ -273,17 +473,56 @@ async function handle(req, res) {
       });
     }
 
-    if (path === '/api/data') {
+    if (path === '/api/routes') {
       if (req.method === 'GET') {
-        const { data, version } = await load();
-        return json(res, 200, { ok: true, version, data: data || null, tomb: cleanTomb(data?.tomb) });
+        const since = url.searchParams.get('since') || '0000-00-00';
+        const store = await loadRoutes();
+        const items = Object.values(store.items)
+          .filter(it => it && typeof it.date === 'string' && it.date >= since)
+          .sort((a, b) => a.date.localeCompare(b.date));
+        return json(req, res, 200, { ok: true, items });
       }
       if (req.method === 'POST') {
         let payload;
         try {
           payload = JSON.parse(await readBody(req));
         } catch (err) {
-          return json(res, 400, { ok: false, error: err.message === 'body too large' ? 'Backup too large' : 'Invalid JSON' });
+          return json(req, res, 400, { ok: false, error: err.message === 'body too large' ? 'Payload too large' : 'Invalid JSON' });
+        }
+        const incoming = Array.isArray(payload.items) ? payload.items : [];
+        const store = await loadRoutes();
+        let count = 0;
+        for (const it of incoming) {
+          if (!it || typeof it.shiftId !== 'string' || !it.shiftId) continue;
+          if (typeof it.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(it.date)) continue;
+          if (typeof it.blob !== 'string' || it.blob.length < 16 || it.blob.length > 400_000) continue;
+          store.items[it.shiftId] = { shiftId: it.shiftId, date: it.date, blob: it.blob, at: new Date().toISOString() };
+          count++;
+        }
+        if (count === 0) return json(req, res, 400, { ok: false, error: 'No valid route items' });
+        await saveRoutes(store);
+        return json(req, res, 200, { ok: true, count, stored: Object.keys(store.items).length });
+      }
+      return json(req, res, 405, { ok: false, error: 'Use GET or POST' });
+    }
+
+    if (path === '/api/data') {
+      if (req.method === 'GET') {
+        const { data, version } = await load();
+        const etag = `W/"${version}"`;
+        res.setHeader('etag', etag);
+        if (req.headers['if-none-match'] === etag) {
+          res.writeHead(304, { etag, 'cache-control': 'no-store' });
+          return res.end();
+        }
+        return json(req, res, 200, { ok: true, version, data: data || null, tomb: cleanTomb(data?.tomb) });
+      }
+      if (req.method === 'POST') {
+        let payload;
+        try {
+          payload = JSON.parse(await readBody(req));
+        } catch (err) {
+          return json(req, res, 400, { ok: false, error: err.message === 'body too large' ? 'Backup too large' : 'Invalid JSON' });
         }
         // Accept both {data:{...}, replace:false} and a bare store object,
         // so payloads from the app's backup files work directly.
@@ -296,7 +535,7 @@ async function handle(req, res) {
         }
         const incoming = payload && payload.data ? payload.data : payload;
         if (!incoming || typeof incoming !== 'object' || !Array.isArray(incoming.entries)) {
-          return json(res, 400, { ok: false, error: 'Expected { entries: [...] }' });
+          return json(req, res, 400, { ok: false, error: 'Expected { entries: [...] }' });
         }
         const clean = incoming.entries
           .filter(e => e && typeof e.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(e.date))
@@ -309,6 +548,8 @@ async function handle(req, res) {
             amount: Math.round(Number(e.amount)),
             note: String(e.note || '').slice(0, 200),
             updated: String(e.updated || new Date().toISOString()),
+            // odometer at a fuel stop: the only way to measure real km/L
+            ...(e.cat === 'fuel' && Number.isFinite(Number(e.odo)) && Number(e.odo) > 0 ? { odo: Math.round(Number(e.odo)) } : {}),
             ...(e.sample ? { sample: true } : {}),
           }));
         const cleanShifts = (Array.isArray(incoming.shifts) ? incoming.shifts : []).map(cleanShift).filter(Boolean).slice(0, 5000);
@@ -339,24 +580,86 @@ async function handle(req, res) {
             },
           };
         } else {
-          next = mergeData(current.data, { ...incoming, entries: clean, shifts: cleanShifts }, { deletedIds, deletedCats, undeleteIds });
+          next = mergeData(current.data, {
+            ...incoming,
+            entries: clean,
+            shifts: cleanShifts,
+            bills: (Array.isArray(incoming.bills) ? incoming.bills : []).map(cleanBill).filter(Boolean),
+            billPayments: (Array.isArray(incoming.billPayments) ? incoming.billPayments : []).map(cleanBillPayment).filter(Boolean),
+          }, { deletedIds, deletedCats, undeleteIds });
         }
         await save(next);
+        broadcastChange({ version: cache.version, entries: next.entries.length, at: new Date().toISOString() });
         console.log(`[${new Date().toLocaleTimeString('en-GB')}] saved ${next.entries.length} entries  (${req.headers['x-forwarded-for'] || req.socket.remoteAddress})`);
-        return json(res, 200, { ok: true, version: cache.version, data: next, tomb: cleanTomb(next.tomb), entries: next.entries.length });
+        return json(req, res, 200, { ok: true, version: cache.version, data: next, tomb: cleanTomb(next.tomb), entries: next.entries.length });
       }
-      return json(res, 405, { ok: false, error: 'Use GET or POST' });
+      return json(req, res, 405, { ok: false, error: 'Use GET or POST' });
+    }
+
+    // ---- app download shortcut ----------------------------------------------
+    // /apk always points at the newest APK, so the phone can bookmark one URL.
+    if (path === '/apk') {
+      const found = await newestApk();
+      if (!found) return json(req, res, 404, { ok: false, error: 'No APK published yet' });
+      res.writeHead(302, {
+        location: '/dist-android/' + encodeURIComponent(found.name),
+        'cache-control': 'no-store',
+      });
+      return res.end();
+    }
+
+    // /dl is the "download page": current version, size, and a QR for the phone.
+    if (path === '/dl') {
+      const found = await newestApk();
+      const rows = found ? await apkList() : [];
+      const body = `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Baki — install</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin:0; background:#0D110C; color:#E8F2D6;
+         font:16px/1.5 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+         display:flex; justify-content:center; padding:28px 18px; }
+  main { width:100%; max-width:420px; }
+  h1 { font-size:22px; margin:0 0 4px; }
+  p.sub { color:#9AA694; margin:0 0 20px; font-size:14px; }
+  a.big { display:block; text-align:center; background:#B3C78D; color:#141A0C;
+          font-weight:700; text-decoration:none; padding:16px; border-radius:999px;
+          font-size:17px; margin:16px 0 6px; }
+  .meta { color:#9AA694; font-size:13px; text-align:center; }
+  h2 { font-size:12px; letter-spacing:1px; color:#9AA694; margin:26px 0 8px; }
+  ul { list-style:none; padding:0; margin:0; }
+  li { background:#171B12; border-radius:16px; padding:12px 14px; margin-bottom:8px;
+       display:flex; justify-content:space-between; font-size:13px; }
+  li a { color:#B3C78D; text-decoration:none; }
+  .qr { background:#fff; padding:12px; border-radius:18px; width:max-content; margin:14px auto 0; }
+  img { display:block; width:200px; height:200px; }
+</style></head><body><main>
+  <h1>Baki</h1>
+  <p class="sub">Scan once on your phone, then bookmark the page.</p>
+  <div class="qr"><img src="/qr.png" alt="QR code to this page"></div>
+  <a class="big" href="/apk">Download latest APK</a>
+  <div class="meta">${found ? `${found.name} · ${(found.size / 1048576).toFixed(2)} MB · ${found.when}` : 'nothing published yet'}</div>
+  <h2>PREVIOUS BUILDS</h2>
+  <ul>${rows.map(r => `<li><a href="/dist-android/${encodeURIComponent(r.name)}">${r.name}</a><span>${(r.size / 1048576).toFixed(1)} MB</span></li>`).join('')}</ul>
+</main></body></html>`;
+      res.writeHead(200, {
+        'content-type': 'text/html; charset=utf-8',
+        'cache-control': 'no-store',
+        'content-length': Buffer.byteLength(body),
+      });
+      return res.end(body);
     }
 
     if (req.method !== 'GET' && req.method !== 'HEAD') {
-      return json(res, 405, { ok: false, error: 'Method not allowed' });
+      return json(req, res, 405, { ok: false, error: 'Method not allowed' });
     }
 
     // static: serve index.html for / and any unknown path
     const rel = path === '/' ? 'index.html' : path.replace(/^\/+/, '');
     const file = join(ROOT, rel);
     if (!file.startsWith(ROOT + sep) || rel.startsWith('data.json')) {
-      return json(res, 403, { ok: false, error: 'Forbidden' });
+      return json(req, res, 403, { ok: false, error: 'Forbidden' });
     }
     if (existsSync(file)) {
       const body = await readFile(file);
@@ -364,7 +667,9 @@ async function handle(req, res) {
       const headers = {
         'content-type': MIME[ext] || 'application/octet-stream',
         // icons and the shell must never be served stale — a cached icon survives reinstalls
-        'cache-control': (rel === 'index.html' || ext === '.webmanifest' || ext === '.png' || ext === '.ico')
+        // icons, the shell and installers must never be served stale: a cached APK
+        // means an old build gets installed from a link you just refreshed
+        'cache-control': (rel === 'index.html' || ext === '.webmanifest' || ext === '.png' || ext === '.ico' || ext === '.apk')
           ? 'no-store' : 'public, max-age=3600',
       };
       if (rel === 'sw.js') headers['service-worker-allowed'] = '/';
@@ -378,7 +683,7 @@ async function handle(req, res) {
     return res.end(index);
   } catch (err) {
     console.error('[error]', err);
-    if (!res.headersSent) return json(res, 500, { ok: false, error: 'Server error' });
+    if (!res.headersSent) return json(req, res, 500, { ok: false, error: 'Server error' });
     res.end();
   }
 }
@@ -432,6 +737,120 @@ if (running) {
   process.exit(0);
 }
 
+/* ---------- UDP beacon ----------
+ * mDNS works between Node and Node, but mdns-sd (Rust) resolves the PTR and then
+ * never gets an answer to its SRV/TXT query. A plain broadcast has no such
+ * ambiguity: the client just listens on a fixed port.
+ */
+const BEACON_PORT = 43871;   // broadcast, one-way
+const PROBE_PORT = 43872;    // unicast requests (separate, so the client can bind 43871)
+let beaconTimer = null;
+
+function beaconPayload() {
+  return Buffer.from(JSON.stringify({
+    app: 'baki', v: 1,
+    port: httpsServer ? TLS_PORT : PORT,
+    tls: !!httpsServer,
+    plainPort: PORT,          // apps can fall back to this when TLS is untrusted
+    path: '/api',
+    host: hostname(),
+  }));
+}
+
+/** Answer unicast probes: broadcast is filtered on many home routers. */
+function startProbeResponder() {
+  try {
+    const listener = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+    listener.on('error', () => {});
+    listener.on('message', (_msg, rinfo) => {
+      try { const p = beaconPayload(); listener.send(p, 0, p.length, rinfo.port, rinfo.address); } catch (e) {}
+    });
+    listener.bind({ port: PROBE_PORT, exclusive: false });
+  } catch (e) {}
+}
+
+function startBeacon() {
+  if (process.env.NO_MDNS === '1') return;
+  const targets = ['255.255.255.255'];
+  for (const { ip, mask } of lanAddresses()) {
+    // also hit each subnet's directed broadcast, which some APs handle better
+    const b = broadcastOf(ip, mask);
+    if (b && !targets.includes(b)) targets.push(b);
+  }
+  let sock;
+  try {
+    sock = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+    sock.on('error', (e) => console.log('  beacon : off —', e.message));
+    sock.bind(() => {
+      try { sock.setBroadcast(true); } catch (e) {}
+      const send = () => {
+        const payload = Buffer.from(JSON.stringify({
+          app: 'baki', v: 1,
+          port: httpsServer ? TLS_PORT : PORT,
+          tls: !!httpsServer,
+          plainPort: PORT,
+          path: '/api',
+          host: hostname(),
+        }));
+        for (const t of targets) {
+          try { sock.send(payload, 0, payload.length, BEACON_PORT, t); } catch (e) {}
+        }
+      };
+      send();
+      beaconTimer = setInterval(send, 2000);
+      beaconTimer.unref?.();
+
+
+    });
+  } catch (e) {
+    console.log('  beacon : off —', e.message);
+  }
+}
+
+function lanAddresses() {
+  const out = [];
+  for (const list of Object.values(networkInterfaces())) {
+    for (const net of list || []) {
+      if (net.family === 'IPv4' && !net.internal) out.push({ ip: net.address, mask: net.netmask });
+    }
+  }
+  return out;
+}
+function broadcastOf(ip, mask) {
+  const toInt = (a) => a.split('.').reduce((n, o) => (n << 8) + Number(o), 0) >>> 0;
+  const ipN = toInt(ip), mN = toInt(mask);
+  const b = (ipN | (~mN >>> 0)) >>> 0;
+  return [(b >>> 24) & 255, (b >>> 16) & 255, (b >>> 8) & 255, b & 255].join('.');
+}
+
+/* ---------- mDNS: let other devices find this server without typing an IP ----------
+ * Optional dependency: if bonjour-service is not installed the server still runs,
+ * it just cannot be discovered. Set NO_MDNS=1 to switch it off (used by the tests).
+ */
+let mdns = null;
+async function advertise() {
+  if (process.env.NO_MDNS === '1') { console.log('  mDNS   : off (NO_MDNS=1)'); return; }
+  let Bonjour;
+  try { ({ Bonjour } = await import('bonjour-service')); }
+  catch (e) { console.log('  mDNS   : off (npm install bonjour-service to enable discovery)'); return; }
+  try {
+    // include the port: two servers on one machine must not fight over one mDNS name
+    const instance = `Baki on ${hostname()} (${httpsServer ? TLS_PORT : PORT})`;
+    mdns = new Bonjour();
+    const servicePort = httpsServer ? TLS_PORT : PORT;
+    mdns.publish({
+      name: instance,
+      type: 'baki',
+      protocol: 'tcp',
+      port: servicePort,
+      txt: { app: 'baki', v: '1', path: '/api', tls: httpsServer ? '1' : '0', plainPort: String(PORT) },
+    });
+    console.log(`  mDNS   : advertising _baki._tcp on ${servicePort}`);
+  } catch (e) {
+    console.log('  mDNS   : failed —', e.message);
+  }
+}
+
 const servers = [server];
 let httpsServer = null;
 
@@ -444,6 +863,7 @@ if (existsSync(TLS_KEY) && existsSync(TLS_CERT)) {
   httpsServer.listen(TLS_PORT, HOST).on('error', err => failPort(err, TLS_PORT));
 }
 server.listen(PORT, HOST).on('error', err => failPort(err, PORT));
+server.on('listening', () => { advertise(); startBeacon(); startProbeResponder(); });
 
 setTimeout(async () => {
   const { data } = await load();
