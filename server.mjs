@@ -213,6 +213,7 @@ function cleanBillPayment(p) {
     entryId: p.entryId.slice(0, 80),
     paidAt: typeof p.paidAt === 'string' ? p.paidAt : '',
     updated: typeof p.updated === 'string' ? p.updated : '',
+    active: p.active !== false,
   };
 }
 
