@@ -75,6 +75,7 @@ function cleanShift(s) {
     date: s.date,
     start: typeof s.start === 'string' && /^\d{2}:\d{2}$/.test(s.start) ? s.start : '',
     hours: Math.min(24, Math.max(0, Number(s.hours) || 0)),
+    breakMinutes: Math.min(24 * 60, Math.max(0, Math.round(Number(s.breakMinutes) || 0))),
     odoStart: s.odoStart == null || s.odoStart === '' ? null : Math.max(0, Number(s.odoStart) || 0),
     odoEnd: s.odoEnd == null || s.odoEnd === '' ? null : Math.max(0, Number(s.odoEnd) || 0),
     km: Math.max(0, Number(s.km) || 0),
