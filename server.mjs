@@ -62,11 +62,13 @@ function emptyData() {
     entries: [],
     shifts: [],
     statements: {},
-    settings: { name: '', cats: { in: [], out: [] }, profit: {} },
+    settings: { name: '', cats: { in: [], out: [] }, profit: {}, budgets: {}, envelopeCarry: false, reserveTargets: {} },
     tomb: { ids: [], cats: [] },
     dayNotes: {},
     dayCloses: {},
     statementMarks: {},
+    envelopeMoves: {},
+    reserveTxns: [],
   };
 }
 function cleanShift(s) {
@@ -134,6 +136,54 @@ function cleanDayCloses(raw) {
     };
   }
   return out;
+}
+
+function cleanBudgets(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [cat, value] of Object.entries(raw)) {
+    const n = Number(value);
+    if (n > 0) out[String(cat).slice(0, 40)] = n;
+  }
+  return out;
+}
+
+function cleanTargets(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const fund of ['fuel', 'wear']) {
+    const n = Number(raw[fund]);
+    if (Number.isFinite(n) && n > 0) out[fund] = n;
+  }
+  return out;
+}
+
+function cleanEnvelopeMoves(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [month, moves] of Object.entries(raw)) {
+    if (!/^\d{4}-\d{2}$/.test(month) || !moves || typeof moves !== 'object') continue;
+    const clean = {};
+    for (const [cat, value] of Object.entries(moves)) {
+      const n = Number(value);
+      if (Number.isFinite(n) && n !== 0) clean[String(cat).slice(0, 40)] = n;
+    }
+    if (Object.keys(clean).length) out[month] = clean;
+  }
+  return out;
+}
+
+function cleanReserveTxns(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(tx => tx && typeof tx.id === 'string' && ['fuel', 'wear'].includes(tx.fund) && Number.isFinite(Number(tx.amount)) && Number(tx.amount) !== 0)
+    .slice(0, 5000)
+    .map(tx => ({
+      id: tx.id.slice(0, 80), fund: tx.fund,
+      amount: Math.round(Number(tx.amount)),
+      date: typeof tx.date === 'string' ? tx.date : '',
+      note: typeof tx.note === 'string' ? tx.note.slice(0, 120) : '',
+      updated: String(tx.updated || new Date().toISOString()),
+    }));
 }
 
 function cleanStatementMarks(raw) {
@@ -331,6 +381,16 @@ function mergeData(current, incoming, tombstones = {}) {
     const cur = statementMarks[week];
     if (!cur || mark.updated >= cur.updated) statementMarks[week] = mark;
   }
+  const envelopeMoves = { ...cleanEnvelopeMoves(base.envelopeMoves) };
+  for (const [month, moves] of Object.entries(cleanEnvelopeMoves(incoming.envelopeMoves))) {
+    envelopeMoves[month] = { ...(envelopeMoves[month] || {}), ...moves };
+  }
+  const txnById = new Map();
+  for (const tx of cleanReserveTxns(base.reserveTxns)) txnById.set(tx.id, tx);
+  for (const tx of cleanReserveTxns(incoming.reserveTxns)) {
+    const cur = txnById.get(tx.id);
+    if (!cur || tx.updated >= cur.updated) txnById.set(tx.id, tx);
+  }
 
   return {
     v: 1,
@@ -343,6 +403,8 @@ function mergeData(current, incoming, tombstones = {}) {
     dayNotes,
     dayCloses,
     statementMarks,
+    envelopeMoves,
+    reserveTxns: [...txnById.values()],
     settings: {
       name: (incoming.settings && incoming.settings.name) || (base.settings && base.settings.name) || '',
       cats: {
@@ -350,6 +412,12 @@ function mergeData(current, incoming, tombstones = {}) {
         out: mergeCats(base.settings?.cats?.out, incoming.settings?.cats?.out),
       },
       profit: { ...cleanProfit(base.settings?.profit), ...cleanProfit(incoming.settings?.profit) },
+      budgets: Object.prototype.hasOwnProperty.call(incoming.settings || {}, 'budgets')
+        ? cleanBudgets(incoming.settings.budgets) : cleanBudgets(base.settings?.budgets),
+      envelopeCarry: Object.prototype.hasOwnProperty.call(incoming.settings || {}, 'envelopeCarry')
+        ? incoming.settings.envelopeCarry === true : base.settings?.envelopeCarry === true,
+      reserveTargets: Object.prototype.hasOwnProperty.call(incoming.settings || {}, 'reserveTargets')
+        ? cleanTargets(incoming.settings.reserveTargets) : cleanTargets(base.settings?.reserveTargets),
     },
     tomb: {
       ids: [...deletedIds].slice(-TOMB_MAX),
@@ -644,6 +712,9 @@ async function handle(req, res) {
                 out: (incoming.settings?.cats?.out || []).filter(c => !deletedCats.includes(c.id)),
               },
               profit: profitIn,
+              budgets: cleanBudgets(incoming.settings?.budgets),
+              envelopeCarry: incoming.settings?.envelopeCarry === true,
+              reserveTargets: cleanTargets(incoming.settings?.reserveTargets),
             },
             tomb: {
               ids: [...new Set(deletedIds)].filter(id => !undeleteIds.includes(id)).slice(-TOMB_MAX),
@@ -652,6 +723,8 @@ async function handle(req, res) {
             dayNotes: cleanDayNotes(incoming.dayNotes),
             dayCloses: cleanDayCloses(incoming.dayCloses),
             statementMarks: cleanStatementMarks(incoming.statementMarks),
+            envelopeMoves: cleanEnvelopeMoves(incoming.envelopeMoves),
+            reserveTxns: cleanReserveTxns(incoming.reserveTxns),
           };
         } else {
           next = mergeData(current.data, {
