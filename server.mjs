@@ -65,6 +65,8 @@ function emptyData() {
     settings: { name: '', cats: { in: [], out: [] }, profit: {} },
     tomb: { ids: [], cats: [] },
     dayNotes: {},
+    dayCloses: {},
+    statementMarks: {},
   };
 }
 function cleanShift(s) {
@@ -116,6 +118,32 @@ function cleanDayNotes(raw) {
     out[date] = {
       text: note.text.slice(0, 500),
       updated: String(note.updated || new Date().toISOString()),
+    };
+  }
+  return out;
+}
+
+function cleanDayCloses(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [date, close] of Object.entries(raw)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !close || typeof close !== 'object') continue;
+    out[date] = {
+      closed: close.closed !== false,
+      updated: String(close.updated || new Date().toISOString()),
+    };
+  }
+  return out;
+}
+
+function cleanStatementMarks(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [week, mark] of Object.entries(raw)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(week) || !mark || typeof mark !== 'object') continue;
+    out[week] = {
+      reconciled: mark.reconciled !== false,
+      updated: String(mark.updated || new Date().toISOString()),
     };
   }
   return out;
@@ -293,6 +321,16 @@ function mergeData(current, incoming, tombstones = {}) {
     const cur = dayNotes[date];
     if (!cur || note.updated >= cur.updated) dayNotes[date] = note;
   }
+  const dayCloses = { ...cleanDayCloses(base.dayCloses) };
+  for (const [date, close] of Object.entries(cleanDayCloses(incoming.dayCloses))) {
+    const cur = dayCloses[date];
+    if (!cur || close.updated >= cur.updated) dayCloses[date] = close;
+  }
+  const statementMarks = { ...cleanStatementMarks(base.statementMarks) };
+  for (const [week, mark] of Object.entries(cleanStatementMarks(incoming.statementMarks))) {
+    const cur = statementMarks[week];
+    if (!cur || mark.updated >= cur.updated) statementMarks[week] = mark;
+  }
 
   return {
     v: 1,
@@ -303,6 +341,8 @@ function mergeData(current, incoming, tombstones = {}) {
     shifts: [...shiftById.values()],
     statements,
     dayNotes,
+    dayCloses,
+    statementMarks,
     settings: {
       name: (incoming.settings && incoming.settings.name) || (base.settings && base.settings.name) || '',
       cats: {
@@ -610,6 +650,8 @@ async function handle(req, res) {
               cats: [...new Set(deletedCats)].slice(-100),
             },
             dayNotes: cleanDayNotes(incoming.dayNotes),
+            dayCloses: cleanDayCloses(incoming.dayCloses),
+            statementMarks: cleanStatementMarks(incoming.statementMarks),
           };
         } else {
           next = mergeData(current.data, {
@@ -617,6 +659,7 @@ async function handle(req, res) {
             entries: clean,
             shifts: cleanShifts,
             dayNotes: cleanDayNotes(incoming.dayNotes),
+            dayCloses: cleanDayCloses(incoming.dayCloses),
             bills: (Array.isArray(incoming.bills) ? incoming.bills : []).map(cleanBill).filter(Boolean),
             billPayments: (Array.isArray(incoming.billPayments) ? incoming.billPayments : []).map(cleanBillPayment).filter(Boolean),
           }, { deletedIds, deletedCats, undeleteIds });
