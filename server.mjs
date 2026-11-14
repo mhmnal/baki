@@ -64,6 +64,7 @@ function emptyData() {
     statements: {},
     settings: { name: '', cats: { in: [], out: [] }, profit: {} },
     tomb: { ids: [], cats: [] },
+    dayNotes: {},
   };
 }
 function cleanShift(s) {
@@ -105,6 +106,21 @@ function cleanProfit(p) {
   }
   return out;
 }
+/** Optional per-day page notes; old clients simply omit the map. */
+function cleanDayNotes(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [date, note] of Object.entries(raw)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || !note || typeof note !== 'object') continue;
+    if (typeof note.text !== 'string') continue;
+    out[date] = {
+      text: note.text.slice(0, 500),
+      updated: String(note.updated || new Date().toISOString()),
+    };
+  }
+  return out;
+}
+
 function cleanTomb(t) {
   const raw = t && typeof t === 'object' ? t : {};
   return {
@@ -229,7 +245,12 @@ function mergeData(current, incoming, tombstones = {}) {
   for (const e of incoming.entries) {
     if (deletedIds.has(e.id)) continue;
     const cur = byId.get(e.id);
-    if (!cur || String(e.updated || '') >= String(cur.updated || '')) byId.set(e.id, e);
+    if (!cur || String(e.updated || '') >= String(cur.updated || '')) {
+      // Older clients do not know about receipts; preserve one on an unrelated edit.
+      const merged = { ...cur, ...e };
+      if (e.receipt === undefined && cur && typeof cur.receipt === 'string') merged.receipt = cur.receipt;
+      byId.set(e.id, merged);
+    }
   }
   const mergeCats = (a = [], b = []) => {
     const m = new Map();
@@ -267,6 +288,11 @@ function mergeData(current, incoming, tombstones = {}) {
   };
   for (const p of (base.billPayments || [])) putPayment(p);
   for (const p of (incoming.billPayments || [])) putPayment(p);
+  const dayNotes = { ...cleanDayNotes(base.dayNotes) };
+  for (const [date, note] of Object.entries(cleanDayNotes(incoming.dayNotes))) {
+    const cur = dayNotes[date];
+    if (!cur || note.updated >= cur.updated) dayNotes[date] = note;
+  }
 
   return {
     v: 1,
@@ -276,6 +302,7 @@ function mergeData(current, incoming, tombstones = {}) {
     billPayments: [...paymentByKey.values()],
     shifts: [...shiftById.values()],
     statements,
+    dayNotes,
     settings: {
       name: (incoming.settings && incoming.settings.name) || (base.settings && base.settings.name) || '',
       cats: {
@@ -552,6 +579,8 @@ async function handle(req, res) {
             updated: String(e.updated || new Date().toISOString()),
             // odometer at a fuel stop: the only way to measure real km/L
             ...(e.cat === 'fuel' && Number.isFinite(Number(e.odo)) && Number(e.odo) > 0 ? { odo: Math.round(Number(e.odo)) } : {}),
+            // Small synced JPEG receipt; absent means "no change" for older clients.
+            ...(typeof e.receipt === 'string' && e.receipt.length <= 180_000 ? { receipt: e.receipt } : {}),
             ...(e.sample ? { sample: true } : {}),
           }));
         const cleanShifts = (Array.isArray(incoming.shifts) ? incoming.shifts : []).map(cleanShift).filter(Boolean).slice(0, 5000);
@@ -580,12 +609,14 @@ async function handle(req, res) {
               ids: [...new Set(deletedIds)].filter(id => !undeleteIds.includes(id)).slice(-TOMB_MAX),
               cats: [...new Set(deletedCats)].slice(-100),
             },
+            dayNotes: cleanDayNotes(incoming.dayNotes),
           };
         } else {
           next = mergeData(current.data, {
             ...incoming,
             entries: clean,
             shifts: cleanShifts,
+            dayNotes: cleanDayNotes(incoming.dayNotes),
             bills: (Array.isArray(incoming.bills) ? incoming.bills : []).map(cleanBill).filter(Boolean),
             billPayments: (Array.isArray(incoming.billPayments) ? incoming.billPayments : []).map(cleanBillPayment).filter(Boolean),
           }, { deletedIds, deletedCats, undeleteIds });
