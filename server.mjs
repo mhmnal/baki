@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import zlib from 'node:zlib';
+import crypto from 'node:crypto';
 /**
  * Baki sync server
  * ---------------------------------------------------------------
@@ -35,6 +36,8 @@ const TLS_CERT = join(TLS_DIR, 'server.crt');
 const TLS_CA = join(TLS_DIR, 'ca.crt');
 const HOST = process.env.HOST || '0.0.0.0';
 const MAX_BODY = 8 * 1024 * 1024;
+// Optional shared API token. Empty keeps the original open-LAN behaviour.
+const TOKEN = String(process.env.BAKI_TOKEN || '').trim();
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -542,6 +545,16 @@ function shutdown() {
 process.on('SIGINT', shutdown);
 process.on('SIGTERM', shutdown);
 
+function authorized(req) {
+  if (!TOKEN) return true;
+  const supplied = req.headers['x-baki-token'] ||
+    String(req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+  if (!supplied) return false;
+  const a = Buffer.from(String(supplied));
+  const b = Buffer.from(TOKEN);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 async function handle(req, res) {
   const url = new URL(req.url, 'http://' + (req.headers.host || 'localhost'));
   const path = decodeURIComponent(url.pathname);
@@ -553,8 +566,14 @@ async function handle(req, res) {
   // CORS: allows the same HTML opened as a local file to talk to this server.
   res.setHeader('access-control-allow-origin', '*');
   res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
-  res.setHeader('access-control-allow-headers', 'content-type');
+  res.setHeader('access-control-allow-headers', 'content-type, x-baki-token, authorization');
   if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
+
+  // The ledger and movement APIs require the token when one is configured. Ping and the
+  // install/CA pages remain public for discovery and setup.
+  if (path.startsWith('/api/') && path !== '/api/ping' && !authorized(req)) {
+    return json(req, res, 401, { ok: false, error: 'Unauthorized' });
+  }
 
   try {
     // The private CA certificate, so a phone can download and trust it.
@@ -1030,6 +1049,8 @@ setTimeout(async () => {
     console.log('  Plain (works now, no install):');
   } else {
     console.log('  For app install + offline mode, run ./tools/setup-https.sh once.');
+    if (TOKEN) console.log('  API token: required (BAKI_TOKEN is set).');
+    else console.warn('  [security] API token is not set; the ledger API is open on this LAN. Set BAKI_TOKEN to require one.');
     console.log('  Addresses (plain):');
   }
   console.log(`    Laptop  : http://localhost:${PORT}`);
