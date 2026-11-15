@@ -65,7 +65,7 @@ function emptyData() {
     entries: [],
     shifts: [],
     statements: {},
-    settings: { name: '', cats: { in: [], out: [] }, profit: {}, budgets: {}, envelopeCarry: false, reserveTargets: {} },
+    settings: { name: '', cats: { in: [], out: [] }, profit: {}, budgets: {}, gpsCorrection: 1, dailyFoodCapCents: null, nextServiceKm: null, nextServiceOn: null, envelopeCarry: false, reserveTargets: {} },
     tomb: { ids: [], cats: [] },
     dayNotes: {},
     dayCloses: {},
@@ -417,6 +417,29 @@ function mergeData(current, incoming, tombstones = {}) {
       profit: { ...cleanProfit(base.settings?.profit), ...cleanProfit(incoming.settings?.profit) },
       budgets: Object.prototype.hasOwnProperty.call(incoming.settings || {}, 'budgets')
         ? cleanBudgets(incoming.settings.budgets) : cleanBudgets(base.settings?.budgets),
+      // These came after the original server schema. Presence checks keep older clients from
+      // erasing them, while allowing the current client to explicitly clear them.
+      gpsCorrection: Object.prototype.hasOwnProperty.call(incoming.settings || {}, 'gpsCorrection')
+        && Number.isFinite(Number(incoming.settings.gpsCorrection))
+        && Number(incoming.settings.gpsCorrection) > 0
+        ? Number(incoming.settings.gpsCorrection)
+        : (Number.isFinite(Number(base.settings?.gpsCorrection)) && Number(base.settings?.gpsCorrection) > 0
+          ? Number(base.settings.gpsCorrection) : 1),
+      dailyFoodCapCents: Object.prototype.hasOwnProperty.call(incoming.settings || {}, 'dailyFoodCapCents')
+        ? (Number.isFinite(Number(incoming.settings.dailyFoodCapCents)) && Number(incoming.settings.dailyFoodCapCents) > 0
+          ? Math.round(Number(incoming.settings.dailyFoodCapCents)) : null)
+        : (Number.isFinite(Number(base.settings?.dailyFoodCapCents)) && Number(base.settings?.dailyFoodCapCents) > 0
+          ? Math.round(Number(base.settings.dailyFoodCapCents)) : null),
+      nextServiceKm: Object.prototype.hasOwnProperty.call(incoming.settings || {}, 'nextServiceKm')
+        ? (Number.isFinite(Number(incoming.settings.nextServiceKm)) && Number(incoming.settings.nextServiceKm) > 0
+          ? Math.round(Number(incoming.settings.nextServiceKm)) : null)
+        : (Number.isFinite(Number(base.settings?.nextServiceKm)) && Number(base.settings?.nextServiceKm) > 0
+          ? Math.round(Number(base.settings.nextServiceKm)) : null),
+      nextServiceOn: Object.prototype.hasOwnProperty.call(incoming.settings || {}, 'nextServiceOn')
+        ? (typeof incoming.settings.nextServiceOn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(incoming.settings.nextServiceOn)
+          ? incoming.settings.nextServiceOn : null)
+        : (typeof base.settings?.nextServiceOn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(base.settings.nextServiceOn)
+          ? base.settings.nextServiceOn : null),
       envelopeCarry: Object.prototype.hasOwnProperty.call(incoming.settings || {}, 'envelopeCarry')
         ? incoming.settings.envelopeCarry === true : base.settings?.envelopeCarry === true,
       reserveTargets: Object.prototype.hasOwnProperty.call(incoming.settings || {}, 'reserveTargets')
