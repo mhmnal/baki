@@ -199,6 +199,8 @@ function cleanImported(raw) {
       suggestedEntryId: t.suggestedEntryId ? String(t.suggestedEntryId).slice(0, 80) : null,
       batchId: String(t.batchId || '').slice(0, 80),
       pairId: String(t.pairId || '').slice(0, 80),
+      suggestedPairId: String(t.suggestedPairId || '').slice(0, 80),
+      pairRejected: t.pairRejected === true,
       updated: String(t.updated || new Date().toISOString()),
     }));
 }
