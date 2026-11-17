@@ -824,6 +824,7 @@ async function handle(req, res) {
           if (!old || t.updated >= old.updated) txnMap.set(t.id, t);
         }
         const monthCloses = { ...(base.monthCloses || {}) };
+        for (const month of Array.isArray(payload.removedMonths) ? payload.removedMonths : []) delete monthCloses[String(month)];
         if (payload.monthCloses && typeof payload.monthCloses === 'object' && !Array.isArray(payload.monthCloses)) {
           for (const [month, at] of Object.entries(payload.monthCloses)) {
             if (/^\d{4}-\d{2}$/.test(month) && typeof at === 'string') monthCloses[month] = at;
