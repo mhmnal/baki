@@ -75,6 +75,7 @@ function emptyData() {
     odometerReadings: [],
     accounts: [],
     importedTxns: [],
+    statementBatches: [],
   };
 }
 function cleanShift(s) {
@@ -196,9 +197,23 @@ function cleanImported(raw) {
       status: ['pending', 'accepted', 'ignored'].includes(t.status) ? t.status : 'pending',
       entryId: t.entryId ? String(t.entryId).slice(0, 80) : null,
       suggestedEntryId: t.suggestedEntryId ? String(t.suggestedEntryId).slice(0, 80) : null,
+      batchId: String(t.batchId || '').slice(0, 80),
+      pairId: String(t.pairId || '').slice(0, 80),
       updated: String(t.updated || new Date().toISOString()),
     }));
 }
+function cleanStatementBatches(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(b => b && typeof b.id === 'string').slice(0, 500).map(b => ({
+    id: b.id.slice(0, 80), accountId: String(b.accountId || '').slice(0, 80),
+    source: String(b.source || '').slice(0, 20), importedAt: String(b.importedAt || ''),
+    periodStart: String(b.periodStart || ''), periodEnd: String(b.periodEnd || ''),
+    rowCount: Math.max(0, Math.round(Number(b.rowCount) || 0)),
+    duplicateCount: Math.max(0, Math.round(Number(b.duplicateCount) || 0)),
+    deletedAt: String(b.deletedAt || ''),
+  }));
+}
+
 function cleanOdometerReadings(raw) {
   if (!Array.isArray(raw)) return [];
   return raw
@@ -746,6 +761,49 @@ async function handle(req, res) {
       return json(req, res, 405, { ok: false, error: 'Use GET or POST' });
     }
 
+    if (path === '/api/statements') {
+      const { data: current } = await load();
+      if (req.method === 'GET') {
+        return json(req, res, 200, {
+          ok: true,
+          accounts: cleanAccounts(current?.accounts),
+          batches: cleanStatementBatches(current?.statementBatches),
+          txns: cleanImported(current?.importedTxns),
+        });
+      }
+      if (req.method === 'POST') {
+        let payload;
+        try {
+          payload = JSON.parse(await readBody(req));
+        } catch (err) {
+          return json(req, res, 400, { ok: false, error: err.message === 'body too large' ? 'Payload too large' : 'Invalid JSON' });
+        }
+        const base = current || emptyData();
+        const deleted = new Set(Array.isArray(payload.deletedBatchIds) ? payload.deletedBatchIds.map(String) : []);
+        const accountMap = new Map(cleanAccounts(base.accounts).map(a => [a.id, a]));
+        for (const a of cleanAccounts(payload.accounts)) accountMap.set(a.id, a);
+        const batchMap = new Map(cleanStatementBatches(base.statementBatches).map(b => [b.id, b]));
+        for (const b of cleanStatementBatches(payload.batches)) batchMap.set(b.id, b);
+        const txnMap = new Map(cleanImported(base.importedTxns).map(t => [t.id, t]));
+        for (const t of cleanImported(payload.txns)) {
+          if (deleted.has(t.batchId)) continue;
+          txnMap.set(t.id, t);
+        }
+        for (const t of [...txnMap.values()]) if (deleted.has(t.batchId)) txnMap.delete(t.id);
+        const next = save && {
+          ...base,
+          accounts: [...accountMap.values()],
+          statementBatches: [...batchMap.values()],
+          importedTxns: [...txnMap.values()],
+          updatedAt: new Date().toISOString(),
+        };
+        await save(next);
+        broadcastChange({ version: cache.version, entries: next.entries.length, at: next.updatedAt });
+        return json(req, res, 200, { ok: true, accounts: next.accounts, batches: next.statementBatches, txns: next.importedTxns });
+      }
+      return json(req, res, 405, { ok: false, error: 'Use GET or POST' });
+    }
+
     if (path === '/api/data') {
       if (req.method === 'GET') {
         const { data, version } = await load();
@@ -755,7 +813,12 @@ async function handle(req, res) {
           res.writeHead(304, { etag, 'cache-control': 'no-store' });
           return res.end();
         }
-        return json(req, res, 200, { ok: true, version, data: data || null, tomb: cleanTomb(data?.tomb) });
+        if (!data) return json(req, res, 200, { ok: true, version, data: null, tomb: cleanTomb(null) });
+        const publicData = { ...data };
+        delete publicData.accounts;
+        delete publicData.importedTxns;
+        delete publicData.statementBatches;
+        return json(req, res, 200, { ok: true, version, data: publicData, tomb: cleanTomb(data.tomb) });
       }
       if (req.method === 'POST') {
         let payload;
