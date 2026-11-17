@@ -182,7 +182,7 @@ function cleanEnvelopeMoves(raw) {
 function cleanAccounts(raw) {
   if (!Array.isArray(raw)) return [];
   return raw.filter(a => a && typeof a.id === 'string' && typeof a.name === 'string')
-    .slice(0, 50).map(a => ({ id: a.id.slice(0, 80), name: a.name.slice(0, 80), kind: a.kind === 'ewallet' ? 'ewallet' : 'bank' }));
+    .slice(0, 50).map(a => ({ id: a.id.slice(0, 80), name: a.name.slice(0, 80), kind: a.kind === 'ewallet' ? 'ewallet' : 'bank', openingBalance: Math.round(Number(a.openingBalance) || 0), openingDate: typeof a.openingDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(a.openingDate) ? a.openingDate : '', archived: a.archived === true }));
 }
 function cleanImported(raw) {
   if (!Array.isArray(raw)) return [];
