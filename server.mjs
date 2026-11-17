@@ -486,13 +486,11 @@ function mergeData(current, incoming, tombstones = {}) {
     updatedAt: new Date().toISOString(),
     entries: [...byId.values()],
     odometerReadings: [...readingById.values()],
-    accounts: cleanAccounts(incoming.accounts).length ? cleanAccounts(incoming.accounts) : cleanAccounts(base.accounts),
-    importedTxns: (() => {
-      const m = new Map();
-      for (const t of cleanImported(base.importedTxns)) m.set(t.id, t);
-      for (const t of cleanImported(incoming.importedTxns)) { const c = m.get(t.id); if (!c || t.updated >= c.updated) m.set(t.id, t); }
-      return [...m.values()];
-    })(),
+    // Statement sidecar is owned by /api/statements. A ledger push must never erase it.
+    accounts: cleanAccounts(base.accounts),
+    importedTxns: cleanImported(base.importedTxns),
+    statementBatches: cleanStatementBatches(base.statementBatches),
+    monthCloses: base.monthCloses && typeof base.monthCloses === 'object' && !Array.isArray(base.monthCloses) ? base.monthCloses : {},
     bills: [...billById.values()],
     billPayments: [...paymentByKey.values()],
     shifts: [...shiftById.values()],
@@ -947,8 +945,10 @@ async function handle(req, res) {
             envelopeMoves: cleanEnvelopeMoves(incoming.envelopeMoves),
             reserveTxns: cleanReserveTxns(incoming.reserveTxns),
             odometerReadings: cleanOdometerReadings(incoming.odometerReadings),
-            accounts: cleanAccounts(incoming.accounts),
-            importedTxns: cleanImported(incoming.importedTxns),
+            accounts: current.data?.accounts || [],
+            importedTxns: current.data?.importedTxns || [],
+            statementBatches: current.data?.statementBatches || [],
+            monthCloses: current.data?.monthCloses || {},
           };
         } else {
           next = mergeData(current.data, {
