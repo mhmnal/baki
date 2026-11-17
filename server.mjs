@@ -194,13 +194,14 @@ function cleanImported(raw) {
       amount: Math.max(0, Math.round(Number(t.amount) || 0)),
       direction: t.direction === 'in' ? 'in' : 'out',
       transfer: t.transfer === true, source: String(t.source || '').slice(0, 20),
-      status: ['pending', 'accepted', 'ignored'].includes(t.status) ? t.status : 'pending',
+      status: ['pending', 'accepted', 'ignored', 'matched', 'internal'].includes(t.status) ? t.status : 'pending',
       entryId: t.entryId ? String(t.entryId).slice(0, 80) : null,
       suggestedEntryId: t.suggestedEntryId ? String(t.suggestedEntryId).slice(0, 80) : null,
       batchId: String(t.batchId || '').slice(0, 80),
       pairId: String(t.pairId || '').slice(0, 80),
       suggestedPairId: String(t.suggestedPairId || '').slice(0, 80),
       pairRejected: t.pairRejected === true,
+      internal: t.internal === true,
       updated: String(t.updated || new Date().toISOString()),
     }));
 }
