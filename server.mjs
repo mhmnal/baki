@@ -792,6 +792,11 @@ async function handle(req, res) {
           txnMap.set(t.id, t);
         }
         for (const t of [...txnMap.values()]) if (deleted.has(t.batchId)) txnMap.delete(t.id);
+        const deletedAt = new Date().toISOString();
+        for (const id of deleted) {
+          const b = batchMap.get(id);
+          if (b && !b.deletedAt) batchMap.set(id, { ...b, deletedAt });
+        }
         const next = save && {
           ...base,
           accounts: [...accountMap.values()],
