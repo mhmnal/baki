@@ -65,13 +65,14 @@ function emptyData() {
     entries: [],
     shifts: [],
     statements: {},
-    settings: { name: '', cats: { in: [], out: [] }, profit: {}, budgets: {}, gpsCorrection: 1, dailyFoodCapCents: null, nextServiceKm: null, nextServiceOn: null, envelopeCarry: false, reserveTargets: {} },
+    settings: { name: '', cats: { in: [], out: [] }, profit: {}, budgets: {}, gpsCorrection: 1, dailyFoodCapCents: null, nextServiceKm: null, nextServiceOn: null, envelopeCarry: false, reserveTargets: {}, serviceOdoBase: null, serviceOdoBaseOn: null },
     tomb: { ids: [], cats: [] },
     dayNotes: {},
     dayCloses: {},
     statementMarks: {},
     envelopeMoves: {},
     reserveTxns: [],
+    odometerReadings: [],
   };
 }
 function cleanShift(s) {
@@ -174,6 +175,20 @@ function cleanEnvelopeMoves(raw) {
     if (Object.keys(clean).length) out[month] = clean;
   }
   return out;
+}
+
+function cleanOdometerReadings(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw
+    .filter(r => r && typeof r.id === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(String(r.date || '')) && Number.isFinite(Number(r.km)) && Number(r.km) > 0)
+    .slice(0, 5000)
+    .map(r => ({
+      id: r.id.slice(0, 80),
+      date: r.date,
+      km: Math.round(Number(r.km)),
+      note: typeof r.note === 'string' ? r.note.slice(0, 80) : '',
+      updated: String(r.updated || new Date().toISOString()),
+    }));
 }
 
 function cleanReserveTxns(raw) {
@@ -395,10 +410,17 @@ function mergeData(current, incoming, tombstones = {}) {
     if (!cur || tx.updated >= cur.updated) txnById.set(tx.id, tx);
   }
 
+  const readingById = new Map();
+  for (const r of cleanOdometerReadings(base.odometerReadings)) readingById.set(r.id, r);
+  for (const r of cleanOdometerReadings(incoming.odometerReadings)) {
+    const cur = readingById.get(r.id);
+    if (!cur || r.updated >= cur.updated) readingById.set(r.id, r);
+  }
   return {
     v: 1,
     updatedAt: new Date().toISOString(),
     entries: [...byId.values()],
+    odometerReadings: [...readingById.values()],
     bills: [...billById.values()],
     billPayments: [...paymentByKey.values()],
     shifts: [...shiftById.values()],
@@ -444,6 +466,16 @@ function mergeData(current, incoming, tombstones = {}) {
         ? incoming.settings.envelopeCarry === true : base.settings?.envelopeCarry === true,
       reserveTargets: Object.prototype.hasOwnProperty.call(incoming.settings || {}, 'reserveTargets')
         ? cleanTargets(incoming.settings.reserveTargets) : cleanTargets(base.settings?.reserveTargets),
+      serviceOdoBase: Object.prototype.hasOwnProperty.call(incoming.settings || {}, 'serviceOdoBase')
+        ? (Number.isFinite(Number(incoming.settings.serviceOdoBase)) && Number(incoming.settings.serviceOdoBase) > 0
+          ? Math.round(Number(incoming.settings.serviceOdoBase)) : null)
+        : (Number.isFinite(Number(base.settings?.serviceOdoBase)) && Number(base.settings?.serviceOdoBase) > 0
+          ? Math.round(Number(base.settings.serviceOdoBase)) : null),
+      serviceOdoBaseOn: Object.prototype.hasOwnProperty.call(incoming.settings || {}, 'serviceOdoBaseOn')
+        ? (typeof incoming.settings.serviceOdoBaseOn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(incoming.settings.serviceOdoBaseOn)
+          ? incoming.settings.serviceOdoBaseOn : null)
+        : (typeof base.settings?.serviceOdoBaseOn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(base.settings.serviceOdoBaseOn)
+          ? base.settings.serviceOdoBaseOn : null),
     },
     tomb: {
       ids: [...deletedIds].slice(-TOMB_MAX),
@@ -757,6 +789,10 @@ async function handle(req, res) {
               budgets: cleanBudgets(incoming.settings?.budgets),
               envelopeCarry: incoming.settings?.envelopeCarry === true,
               reserveTargets: cleanTargets(incoming.settings?.reserveTargets),
+              serviceOdoBase: Number.isFinite(Number(incoming.settings?.serviceOdoBase)) && Number(incoming.settings?.serviceOdoBase) > 0
+                ? Math.round(Number(incoming.settings.serviceOdoBase)) : null,
+              serviceOdoBaseOn: typeof incoming.settings?.serviceOdoBaseOn === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(incoming.settings.serviceOdoBaseOn)
+                ? incoming.settings.serviceOdoBaseOn : null,
             },
             tomb: {
               ids: [...new Set(deletedIds)].filter(id => !undeleteIds.includes(id)).slice(-TOMB_MAX),
@@ -767,6 +803,7 @@ async function handle(req, res) {
             statementMarks: cleanStatementMarks(incoming.statementMarks),
             envelopeMoves: cleanEnvelopeMoves(incoming.envelopeMoves),
             reserveTxns: cleanReserveTxns(incoming.reserveTxns),
+            odometerReadings: cleanOdometerReadings(incoming.odometerReadings),
           };
         } else {
           next = mergeData(current.data, {
@@ -777,6 +814,7 @@ async function handle(req, res) {
             dayCloses: cleanDayCloses(incoming.dayCloses),
             bills: (Array.isArray(incoming.bills) ? incoming.bills : []).map(cleanBill).filter(Boolean),
             billPayments: (Array.isArray(incoming.billPayments) ? incoming.billPayments : []).map(cleanBillPayment).filter(Boolean),
+            odometerReadings: cleanOdometerReadings(incoming.odometerReadings),
           }, { deletedIds, deletedCats, undeleteIds });
         }
         await save(next);
