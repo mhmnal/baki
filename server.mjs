@@ -73,6 +73,8 @@ function emptyData() {
     envelopeMoves: {},
     reserveTxns: [],
     odometerReadings: [],
+    accounts: [],
+    importedTxns: [],
   };
 }
 function cleanShift(s) {
@@ -177,6 +179,26 @@ function cleanEnvelopeMoves(raw) {
   return out;
 }
 
+function cleanAccounts(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(a => a && typeof a.id === 'string' && typeof a.name === 'string')
+    .slice(0, 50).map(a => ({ id: a.id.slice(0, 80), name: a.name.slice(0, 80), kind: a.kind === 'ewallet' ? 'ewallet' : 'bank' }));
+}
+function cleanImported(raw) {
+  if (!Array.isArray(raw)) return [];
+  return raw.filter(t => t && typeof t.id === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(String(t.date || '')))
+    .slice(0, 5000).map(t => ({
+      id: t.id.slice(0, 80), accountId: String(t.accountId || '').slice(0, 80),
+      date: t.date, description: String(t.description || '').slice(0, 160),
+      amount: Math.max(0, Math.round(Number(t.amount) || 0)),
+      direction: t.direction === 'in' ? 'in' : 'out',
+      transfer: t.transfer === true, source: String(t.source || '').slice(0, 20),
+      status: ['pending', 'accepted', 'ignored'].includes(t.status) ? t.status : 'pending',
+      entryId: t.entryId ? String(t.entryId).slice(0, 80) : null,
+      suggestedEntryId: t.suggestedEntryId ? String(t.suggestedEntryId).slice(0, 80) : null,
+      updated: String(t.updated || new Date().toISOString()),
+    }));
+}
 function cleanOdometerReadings(raw) {
   if (!Array.isArray(raw)) return [];
   return raw
@@ -421,6 +443,13 @@ function mergeData(current, incoming, tombstones = {}) {
     updatedAt: new Date().toISOString(),
     entries: [...byId.values()],
     odometerReadings: [...readingById.values()],
+    accounts: cleanAccounts(incoming.accounts).length ? cleanAccounts(incoming.accounts) : cleanAccounts(base.accounts),
+    importedTxns: (() => {
+      const m = new Map();
+      for (const t of cleanImported(base.importedTxns)) m.set(t.id, t);
+      for (const t of cleanImported(incoming.importedTxns)) { const c = m.get(t.id); if (!c || t.updated >= c.updated) m.set(t.id, t); }
+      return [...m.values()];
+    })(),
     bills: [...billById.values()],
     billPayments: [...paymentByKey.values()],
     shifts: [...shiftById.values()],
@@ -804,6 +833,8 @@ async function handle(req, res) {
             envelopeMoves: cleanEnvelopeMoves(incoming.envelopeMoves),
             reserveTxns: cleanReserveTxns(incoming.reserveTxns),
             odometerReadings: cleanOdometerReadings(incoming.odometerReadings),
+            accounts: cleanAccounts(incoming.accounts),
+            importedTxns: cleanImported(incoming.importedTxns),
           };
         } else {
           next = mergeData(current.data, {
@@ -815,6 +846,8 @@ async function handle(req, res) {
             bills: (Array.isArray(incoming.bills) ? incoming.bills : []).map(cleanBill).filter(Boolean),
             billPayments: (Array.isArray(incoming.billPayments) ? incoming.billPayments : []).map(cleanBillPayment).filter(Boolean),
             odometerReadings: cleanOdometerReadings(incoming.odometerReadings),
+            accounts: cleanAccounts(incoming.accounts),
+            importedTxns: cleanImported(incoming.importedTxns),
           }, { deletedIds, deletedCats, undeleteIds });
         }
         await save(next);
