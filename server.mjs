@@ -789,7 +789,8 @@ async function handle(req, res) {
         const txnMap = new Map(cleanImported(base.importedTxns).map(t => [t.id, t]));
         for (const t of cleanImported(payload.txns)) {
           if (deleted.has(t.batchId)) continue;
-          txnMap.set(t.id, t);
+          const old = txnMap.get(t.id);
+          if (!old || t.updated >= old.updated) txnMap.set(t.id, t);
         }
         for (const t of [...txnMap.values()]) if (deleted.has(t.batchId)) txnMap.delete(t.id);
         const deletedAt = new Date().toISOString();
