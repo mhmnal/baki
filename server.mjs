@@ -76,6 +76,7 @@ function emptyData() {
     accounts: [],
     importedTxns: [],
     statementBatches: [],
+    monthCloses: {},
   };
 }
 function cleanShift(s) {
@@ -215,6 +216,30 @@ function cleanStatementBatches(raw) {
     duplicateCount: Math.max(0, Math.round(Number(b.duplicateCount) || 0)),
     deletedAt: String(b.deletedAt || ''),
   }));
+}
+
+function backfillStatementBatches(data) {
+  const rows = cleanImported(data?.importedTxns);
+  const batches = cleanStatementBatches(data?.statementBatches);
+  const known = new Set(batches.map(b => b.id));
+  const groups = new Map();
+  for (const t of rows) {
+    if (!t.batchId || known.has(t.batchId)) continue;
+    const g = groups.get(t.batchId) || { accountId: t.accountId, source: t.source, dates: [], importedAt: t.updated };
+    g.dates.push(t.date);
+    if (t.updated && t.updated < g.importedAt) g.importedAt = t.updated;
+    groups.set(t.batchId, g);
+  }
+  for (const [id, g] of groups) {
+    const dates = g.dates.filter(Boolean).sort();
+    batches.push({
+      id, accountId: g.accountId, source: g.source, importedAt: g.importedAt || new Date().toISOString(),
+      periodStart: dates[0] || '', periodEnd: dates[dates.length - 1] || '', rowCount: g.dates.length,
+      duplicateCount: 0, deletedAt: '',
+    });
+  }
+  if (groups.size) data.statementBatches = batches;
+  return groups.size;
 }
 
 function cleanOdometerReadings(raw) {
@@ -767,11 +792,16 @@ async function handle(req, res) {
     if (path === '/api/statements') {
       const { data: current } = await load();
       if (req.method === 'GET') {
+        if (current) {
+          const added = backfillStatementBatches(current);
+          if (added > 0) await save(current);
+        }
         return json(req, res, 200, {
           ok: true,
           accounts: cleanAccounts(current?.accounts),
           batches: cleanStatementBatches(current?.statementBatches),
           txns: cleanImported(current?.importedTxns),
+          monthCloses: current?.monthCloses && typeof current.monthCloses === 'object' && !Array.isArray(current.monthCloses) ? current.monthCloses : {},
         });
       }
       if (req.method === 'POST') {
@@ -793,6 +823,15 @@ async function handle(req, res) {
           const old = txnMap.get(t.id);
           if (!old || t.updated >= old.updated) txnMap.set(t.id, t);
         }
+        const monthCloses = { ...(base.monthCloses || {}) };
+        if (payload.monthCloses && typeof payload.monthCloses === 'object' && !Array.isArray(payload.monthCloses)) {
+          for (const [month, at] of Object.entries(payload.monthCloses)) {
+            if (/^\d{4}-\d{2}$/.test(month) && typeof at === 'string') monthCloses[month] = at;
+          }
+        }
+        for (const [month] of Object.entries(monthCloses)) {
+          if (payload.monthCloses && Object.prototype.hasOwnProperty.call(payload.monthCloses, month) && !payload.monthCloses[month]) delete monthCloses[month];
+        }
         for (const t of [...txnMap.values()]) if (deleted.has(t.batchId)) txnMap.delete(t.id);
         const deletedAt = new Date().toISOString();
         for (const id of deleted) {
@@ -804,6 +843,7 @@ async function handle(req, res) {
           accounts: [...accountMap.values()],
           statementBatches: [...batchMap.values()],
           importedTxns: [...txnMap.values()],
+          monthCloses,
           updatedAt: new Date().toISOString(),
         };
         await save(next);
@@ -827,6 +867,7 @@ async function handle(req, res) {
         delete publicData.accounts;
         delete publicData.importedTxns;
         delete publicData.statementBatches;
+        delete publicData.monthCloses;
         return json(req, res, 200, { ok: true, version, data: publicData, tomb: cleanTomb(data.tomb) });
       }
       if (req.method === 'POST') {
