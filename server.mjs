@@ -374,6 +374,7 @@ function cleanBill(b) {
     business: b.business === true,
     optional: b.optional === true,
     anchorMonth: Number.isInteger(anchor) && anchor >= 1 && anchor <= 12 ? anchor : null,
+    dueDay: Number.isInteger(Number(b.dueDay)) && Number(b.dueDay) >= 1 && Number(b.dueDay) <= 31 ? Number(b.dueDay) : null,
     updated: typeof b.updated === 'string' ? b.updated : '',
     active: b.active !== false,
   };
