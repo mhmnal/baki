@@ -350,7 +350,7 @@ function cleanStatements(raw) {
       other_income: num(st.other_income),
       incentives: num(st.incentives),
       tips: num(st.tips),
-      insurance_count: num(st.insurance_count),
+      insurance_count: Number.isFinite(Number(st.insurance_count)) ? Number(st.insurance_count) : null,
       consistent: !!st.consistent,
       imported_at: typeof st.imported_at === 'string' ? st.imported_at : '',
     };
