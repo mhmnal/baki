@@ -146,6 +146,22 @@ function cleanDayCloses(raw) {
   return out;
 }
 
+function cleanWeekCloses(raw) {
+  const out = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
+  for (const [week, close] of Object.entries(raw)) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(week) || !close || typeof close !== 'object') continue;
+    out[week] = {
+      week_start: week,
+      received_cents: Math.max(0, Math.round(Number(close.received_cents) || 0)),
+      closed_at: typeof close.closed_at === 'string' ? close.closed_at : '',
+      updated: String(close.updated || new Date().toISOString()),
+      note: typeof close.note === 'string' ? close.note.slice(0, 300) : '',
+    };
+  }
+  return out;
+}
+
 function cleanBudgets(raw) {
   const out = {};
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return out;
@@ -460,6 +476,11 @@ function mergeData(current, incoming, tombstones = {}) {
     const cur = dayCloses[date];
     if (!cur || close.updated >= cur.updated) dayCloses[date] = close;
   }
+  const weekCloses = { ...cleanWeekCloses(base.weekCloses) };
+  for (const [week, close] of Object.entries(cleanWeekCloses(incoming.weekCloses))) {
+    const cur = weekCloses[week];
+    if (!cur || close.updated >= cur.updated) weekCloses[week] = close;
+  }
   const statementMarks = { ...cleanStatementMarks(base.statementMarks) };
   for (const [week, mark] of Object.entries(cleanStatementMarks(incoming.statementMarks))) {
     const cur = statementMarks[week];
@@ -498,6 +519,7 @@ function mergeData(current, incoming, tombstones = {}) {
     statements,
     dayNotes,
     dayCloses,
+    weekCloses,
     statementMarks,
     envelopeMoves,
     reserveTxns: [...txnById.values()],
@@ -942,6 +964,7 @@ async function handle(req, res) {
             },
             dayNotes: cleanDayNotes(incoming.dayNotes),
             dayCloses: cleanDayCloses(incoming.dayCloses),
+            weekCloses: current.data?.weekCloses || {},
             statementMarks: cleanStatementMarks(incoming.statementMarks),
             envelopeMoves: cleanEnvelopeMoves(incoming.envelopeMoves),
             reserveTxns: cleanReserveTxns(incoming.reserveTxns),
@@ -950,6 +973,7 @@ async function handle(req, res) {
             importedTxns: current.data?.importedTxns || [],
             statementBatches: current.data?.statementBatches || [],
             monthCloses: current.data?.monthCloses || {},
+            weekCloses: cleanWeekCloses(incoming.weekCloses),
           };
         } else {
           next = mergeData(current.data, {
