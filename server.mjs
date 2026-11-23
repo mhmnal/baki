@@ -19,12 +19,13 @@ import https from 'node:https';
 import { readFile, writeFile, rename, mkdir, readdir, unlink, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { networkInterfaces, hostname } from 'node:os';
-import { extname, join, resolve, sep } from 'node:path';
+import { dirname, extname, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(fileURLToPath(new URL('.', import.meta.url)));
 const DATA_FILE = process.env.DATA_FILE ? resolve(process.env.DATA_FILE) : join(ROOT, 'data.json');
 const ROUTES_FILE = process.env.ROUTES_FILE ? resolve(process.env.ROUTES_FILE) : join(ROOT, 'routes.json');
+const OPS_FILE = process.env.OPS_FILE ? resolve(process.env.OPS_FILE) : join(dirname(DATA_FILE), 'ops.json');
 const BACKUP_DIR = join(ROOT, 'backups');
 const KEEP_BACKUPS = 30;
 const PORT = Number(process.env.PORT || 8787);
@@ -577,6 +578,104 @@ function mergeData(current, incoming, tombstones = {}) {
   };
 }
 
+let opsCache = null;
+let opsWriteQueue = Promise.resolve();
+const OPS_MAX = 50_000;
+
+async function loadOps() {
+  if (opsCache) return opsCache;
+  if (!existsSync(OPS_FILE)) {
+    opsCache = new Set();
+    return opsCache;
+  }
+  try {
+    const raw = JSON.parse(await readFile(OPS_FILE, 'utf8'));
+    opsCache = new Set((Array.isArray(raw.ids) ? raw.ids : []).map(String).slice(-OPS_MAX));
+  } catch (err) {
+    console.warn('[warn] could not read ops.json:', err.message, '— starting an empty op journal');
+    opsCache = new Set();
+  }
+  return opsCache;
+}
+
+function saveOps(ids) {
+  opsCache = ids;
+  const snapshot = JSON.stringify({ ids: [...ids].slice(-OPS_MAX) }, null, 2);
+  opsWriteQueue = opsWriteQueue.then(async () => {
+    await mkdir(dirname(OPS_FILE), { recursive: true });
+    const tmp = OPS_FILE + '.tmp';
+    await writeFile(tmp, snapshot, 'utf8');
+    await rename(tmp, OPS_FILE);
+  }).catch(err => console.error('[error] op journal write failed:', err.message));
+  return opsWriteQueue;
+}
+
+/** Apply an entry operation to a store using the same newest-wins merge as /api/data. */
+function applyEntryOperation(data, op) {
+  if (op.kind === 'delete') {
+    return mergeData(data, { entries: [] }, { deletedIds: [String(op.entityId)] });
+  }
+  let entry;
+  try { entry = JSON.parse(op.payload); } catch { throw new Error('invalid entry payload'); }
+  if (!entry || typeof entry.id !== 'string' || typeof entry.date !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(entry.date)) {
+    throw new Error('invalid entry operation');
+  }
+  if (!Number.isFinite(Number(entry.amount)) || Number(entry.amount) <= 0) throw new Error('invalid entry amount');
+  return mergeData(data, { entries: [entry] }, {});
+}
+
+/** A generic store replacement is merged, never blindly substituted. */
+function applyStoreOperation(data, op) {
+  let incoming;
+  try { incoming = JSON.parse(op.payload); } catch { throw new Error('invalid store payload'); }
+  if (!incoming || !Array.isArray(incoming.entries)) throw new Error('invalid store operation');
+  // Statement accounts/txns are a separate sidecar; the operation must not overwrite them.
+  delete incoming.accounts;
+  delete incoming.importedTxns;
+  delete incoming.statementBatches;
+  delete incoming.monthCloses;
+  return mergeData(data, incoming, {
+    deletedIds: Array.isArray(incoming.tomb?.ids) ? incoming.tomb.ids : [],
+    deletedCats: Array.isArray(incoming.tomb?.cats) ? incoming.tomb.cats : [],
+  });
+}
+
+async function applyOperations(ops) {
+  if (!Array.isArray(ops) || ops.length === 0) throw new Error('ops must be a non-empty array');
+  if (ops.length > 500) throw new Error('too many operations');
+  // Validate every op before mutating the in-memory cache.
+  for (const op of ops) {
+    if (!op || typeof op.id !== 'string' || !op.id) throw new Error('operation missing id');
+    if (op.entity !== 'entry' && op.entity !== 'store') throw new Error('unknown operation entity');
+    if (op.kind !== 'upsert' && op.kind !== 'delete' && op.kind !== 'replace') throw new Error('unknown operation kind');
+    if (op.entity === 'store' && op.kind !== 'replace') throw new Error('store operation must replace');
+    if (op.entity === 'entry' && op.kind !== 'upsert' && op.kind !== 'delete') throw new Error('entry operation must upsert/delete');
+    if (op.entity === 'entry' && op.kind === 'upsert') {
+      try { JSON.parse(op.payload); } catch { throw new Error('invalid entry payload'); }
+    }
+    if (op.entity === 'store') {
+      try { JSON.parse(op.payload); } catch { throw new Error('invalid store payload'); }
+    }
+  }
+  const acceptedSet = await loadOps();
+  const accepted = [];
+  let data = (await load()).data || emptyData();
+  for (const op of ops) {
+    if (acceptedSet.has(op.id)) { accepted.push(op.id); continue; }
+    data = op.entity === 'entry' ? applyEntryOperation(data, op) : applyStoreOperation(data, op);
+    acceptedSet.add(op.id);
+    accepted.push(op.id);
+    if (acceptedSet.size > OPS_MAX) {
+      const oldest = acceptedSet.values().next().value;
+      acceptedSet.delete(oldest);
+    }
+  }
+  await save(data);
+  await saveOps(acceptedSet);
+  broadcastChange({ version: cache.version, entries: data.entries.length, at: new Date().toISOString() });
+  return accepted;
+}
+
 async function pruneBackups() {
   try {
     const files = (await readdir(BACKUP_DIR)).filter(f => f.endsWith('.json')).sort();
@@ -743,6 +842,8 @@ async function handle(req, res) {
       if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remote)) return json(req, res, 403, { ok: false, error: 'Local only' });
       if (req.method !== 'POST') return json(req, res, 405, { ok: false, error: 'Use POST' });
       await save(emptyData());
+      opsCache = null;
+      await unlink(OPS_FILE).catch(() => {});
       broadcastChange({ version: cache.version, entries: 0, at: new Date().toISOString(), reset: true });
       return json(req, res, 200, { ok: true });
     }
@@ -873,6 +974,22 @@ async function handle(req, res) {
         return json(req, res, 200, { ok: true, accounts: next.accounts, batches: next.statementBatches, txns: next.importedTxns });
       }
       return json(req, res, 405, { ok: false, error: 'Use GET or POST' });
+    }
+
+    if (path === '/api/ops') {
+      if (req.method !== 'POST') return json(req, res, 405, { ok: false, error: 'Use POST' });
+      let payload;
+      try {
+        payload = JSON.parse(await readBody(req));
+      } catch (err) {
+        return json(req, res, 400, { ok: false, error: err.message === 'body too large' ? 'Body too large' : 'Invalid JSON' });
+      }
+      try {
+        const accepted = await applyOperations(payload?.ops);
+        return json(req, res, 200, { ok: true, accepted, version: cache.version, entries: cache.data?.entries?.length || 0 });
+      } catch (err) {
+        return json(req, res, 400, { ok: false, error: err.message });
+      }
     }
 
     if (path === '/api/data') {
