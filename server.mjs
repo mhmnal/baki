@@ -977,6 +977,8 @@ async function handle(req, res) {
     }
 
     if (path === '/api/ops') {
+      // Test-only: exercise the client's pre-G2 full-store fallback.
+      if (process.env.OPS_DISABLED === '1') return json(req, res, 404, { ok: false, error: 'Not found' });
       if (req.method !== 'POST') return json(req, res, 405, { ok: false, error: 'Use POST' });
       let payload;
       try {
