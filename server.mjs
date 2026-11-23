@@ -104,7 +104,11 @@ function cleanShift(s) {
       payouts: s.payouts
         .filter(p => p && Number.isFinite(Number(p.c)) && Number.isFinite(Number(p.at)))
         .slice(0, 200)
-        .map(p => ({ c: Math.round(Number(p.c)), at: Number(p.at) })),
+        .map(p => ({
+          c: Math.round(Number(p.c)),
+          at: Number(p.at),
+          ...(typeof p.source === 'string' && p.source ? { source: p.source.slice(0, 80) } : {}),
+        })),
     } : {}),
     ...(s.sample ? { sample: true } : {}),
     updated: String(s.updated || new Date().toISOString()),
