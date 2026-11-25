@@ -74,10 +74,6 @@ function emptyData() {
     envelopeMoves: {},
     reserveTxns: [],
     odometerReadings: [],
-    accounts: [],
-    importedTxns: [],
-    statementBatches: [],
-    monthCloses: {},
   };
 }
 function cleanShift(s) {
@@ -200,67 +196,6 @@ function cleanEnvelopeMoves(raw) {
     if (Object.keys(clean).length) out[month] = clean;
   }
   return out;
-}
-
-function cleanAccounts(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw.filter(a => a && typeof a.id === 'string' && typeof a.name === 'string')
-    .slice(0, 50).map(a => ({ id: a.id.slice(0, 80), name: a.name.slice(0, 80), kind: a.kind === 'ewallet' ? 'ewallet' : 'bank', openingBalance: Math.round(Number(a.openingBalance) || 0), openingDate: typeof a.openingDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(a.openingDate) ? a.openingDate : '', archived: a.archived === true }));
-}
-function cleanImported(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw.filter(t => t && typeof t.id === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(String(t.date || '')))
-    .slice(0, 5000).map(t => ({
-      id: t.id.slice(0, 80), accountId: String(t.accountId || '').slice(0, 80),
-      date: t.date, description: String(t.description || '').slice(0, 160),
-      amount: Math.max(0, Math.round(Number(t.amount) || 0)),
-      direction: t.direction === 'in' ? 'in' : 'out',
-      transfer: t.transfer === true, source: String(t.source || '').slice(0, 20),
-      status: ['pending', 'accepted', 'ignored', 'matched', 'internal'].includes(t.status) ? t.status : 'pending',
-      entryId: t.entryId ? String(t.entryId).slice(0, 80) : null,
-      suggestedEntryId: t.suggestedEntryId ? String(t.suggestedEntryId).slice(0, 80) : null,
-      batchId: String(t.batchId || '').slice(0, 80),
-      pairId: String(t.pairId || '').slice(0, 80),
-      suggestedPairId: String(t.suggestedPairId || '').slice(0, 80),
-      pairRejected: t.pairRejected === true,
-      internal: t.internal === true,
-      updated: String(t.updated || new Date().toISOString()),
-    }));
-}
-function cleanStatementBatches(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw.filter(b => b && typeof b.id === 'string').slice(0, 500).map(b => ({
-    id: b.id.slice(0, 80), accountId: String(b.accountId || '').slice(0, 80),
-    source: String(b.source || '').slice(0, 20), importedAt: String(b.importedAt || ''),
-    periodStart: String(b.periodStart || ''), periodEnd: String(b.periodEnd || ''),
-    rowCount: Math.max(0, Math.round(Number(b.rowCount) || 0)),
-    duplicateCount: Math.max(0, Math.round(Number(b.duplicateCount) || 0)),
-    deletedAt: String(b.deletedAt || ''),
-  }));
-}
-
-function backfillStatementBatches(data) {
-  const rows = cleanImported(data?.importedTxns);
-  const batches = cleanStatementBatches(data?.statementBatches);
-  const known = new Set(batches.map(b => b.id));
-  const groups = new Map();
-  for (const t of rows) {
-    if (!t.batchId || known.has(t.batchId)) continue;
-    const g = groups.get(t.batchId) || { accountId: t.accountId, source: t.source, dates: [], importedAt: t.updated };
-    g.dates.push(t.date);
-    if (t.updated && t.updated < g.importedAt) g.importedAt = t.updated;
-    groups.set(t.batchId, g);
-  }
-  for (const [id, g] of groups) {
-    const dates = g.dates.filter(Boolean).sort();
-    batches.push({
-      id, accountId: g.accountId, source: g.source, importedAt: g.importedAt || new Date().toISOString(),
-      periodStart: dates[0] || '', periodEnd: dates[dates.length - 1] || '', rowCount: g.dates.length,
-      duplicateCount: 0, deletedAt: '',
-    });
-  }
-  if (groups.size) data.statementBatches = batches;
-  return groups.size;
 }
 
 function cleanOdometerReadings(raw) {
@@ -516,11 +451,6 @@ function mergeData(current, incoming, tombstones = {}) {
     updatedAt: new Date().toISOString(),
     entries: [...byId.values()],
     odometerReadings: [...readingById.values()],
-    // Statement sidecar is owned by /api/statements. A ledger push must never erase it.
-    accounts: cleanAccounts(base.accounts),
-    importedTxns: cleanImported(base.importedTxns),
-    statementBatches: cleanStatementBatches(base.statementBatches),
-    monthCloses: base.monthCloses && typeof base.monthCloses === 'object' && !Array.isArray(base.monthCloses) ? base.monthCloses : {},
     bills: [...billById.values()],
     billPayments: [...paymentByKey.values()],
     shifts: [...shiftById.values()],
@@ -636,11 +566,6 @@ function applyStoreOperation(data, op) {
   let incoming;
   try { incoming = JSON.parse(op.payload); } catch { throw new Error('invalid store payload'); }
   if (!incoming || !Array.isArray(incoming.entries)) throw new Error('invalid store operation');
-  // Statement accounts/txns are a separate sidecar; the operation must not overwrite them.
-  delete incoming.accounts;
-  delete incoming.importedTxns;
-  delete incoming.statementBatches;
-  delete incoming.monthCloses;
   return mergeData(data, incoming, {
     deletedIds: Array.isArray(incoming.tomb?.ids) ? incoming.tomb.ids : [],
     deletedCats: Array.isArray(incoming.tomb?.cats) ? incoming.tomb.cats : [],
@@ -918,71 +843,6 @@ async function handle(req, res) {
       return json(req, res, 405, { ok: false, error: 'Use GET or POST' });
     }
 
-    if (path === '/api/statements') {
-      const { data: current } = await load();
-      if (req.method === 'GET') {
-        if (current) {
-          const added = backfillStatementBatches(current);
-          if (added > 0) await save(current);
-        }
-        return json(req, res, 200, {
-          ok: true,
-          accounts: cleanAccounts(current?.accounts),
-          batches: cleanStatementBatches(current?.statementBatches),
-          txns: cleanImported(current?.importedTxns),
-          monthCloses: current?.monthCloses && typeof current.monthCloses === 'object' && !Array.isArray(current.monthCloses) ? current.monthCloses : {},
-        });
-      }
-      if (req.method === 'POST') {
-        let payload;
-        try {
-          payload = JSON.parse(await readBody(req));
-        } catch (err) {
-          return json(req, res, 400, { ok: false, error: err.message === 'body too large' ? 'Payload too large' : 'Invalid JSON' });
-        }
-        const base = current || emptyData();
-        const deleted = new Set(Array.isArray(payload.deletedBatchIds) ? payload.deletedBatchIds.map(String) : []);
-        const accountMap = new Map(cleanAccounts(base.accounts).map(a => [a.id, a]));
-        for (const a of cleanAccounts(payload.accounts)) accountMap.set(a.id, a);
-        const batchMap = new Map(cleanStatementBatches(base.statementBatches).map(b => [b.id, b]));
-        for (const b of cleanStatementBatches(payload.batches)) batchMap.set(b.id, b);
-        const txnMap = new Map(cleanImported(base.importedTxns).map(t => [t.id, t]));
-        for (const t of cleanImported(payload.txns)) {
-          if (deleted.has(t.batchId)) continue;
-          const old = txnMap.get(t.id);
-          if (!old || t.updated >= old.updated) txnMap.set(t.id, t);
-        }
-        const monthCloses = { ...(base.monthCloses || {}) };
-        for (const month of Array.isArray(payload.removedMonths) ? payload.removedMonths : []) delete monthCloses[String(month)];
-        if (payload.monthCloses && typeof payload.monthCloses === 'object' && !Array.isArray(payload.monthCloses)) {
-          for (const [month, at] of Object.entries(payload.monthCloses)) {
-            if (/^\d{4}-\d{2}$/.test(month) && typeof at === 'string') monthCloses[month] = at;
-          }
-        }
-        for (const [month] of Object.entries(monthCloses)) {
-          if (payload.monthCloses && Object.prototype.hasOwnProperty.call(payload.monthCloses, month) && !payload.monthCloses[month]) delete monthCloses[month];
-        }
-        for (const t of [...txnMap.values()]) if (deleted.has(t.batchId)) txnMap.delete(t.id);
-        const deletedAt = new Date().toISOString();
-        for (const id of deleted) {
-          const b = batchMap.get(id);
-          if (b && !b.deletedAt) batchMap.set(id, { ...b, deletedAt });
-        }
-        const next = save && {
-          ...base,
-          accounts: [...accountMap.values()],
-          statementBatches: [...batchMap.values()],
-          importedTxns: [...txnMap.values()],
-          monthCloses,
-          updatedAt: new Date().toISOString(),
-        };
-        await save(next);
-        broadcastChange({ version: cache.version, entries: next.entries.length, at: next.updatedAt });
-        return json(req, res, 200, { ok: true, accounts: next.accounts, batches: next.statementBatches, txns: next.importedTxns });
-      }
-      return json(req, res, 405, { ok: false, error: 'Use GET or POST' });
-    }
-
     if (path === '/api/ops') {
       // Test-only: exercise the client's pre-G2 full-store fallback.
       if (process.env.OPS_DISABLED === '1') return json(req, res, 404, { ok: false, error: 'Not found' });
@@ -1012,10 +872,6 @@ async function handle(req, res) {
         }
         if (!data) return json(req, res, 200, { ok: true, version, data: null, tomb: cleanTomb(null) });
         const publicData = { ...data };
-        delete publicData.accounts;
-        delete publicData.importedTxns;
-        delete publicData.statementBatches;
-        delete publicData.monthCloses;
         return json(req, res, 200, { ok: true, version, data: publicData, tomb: cleanTomb(data.tomb) });
       }
       if (req.method === 'POST') {
@@ -1095,10 +951,6 @@ async function handle(req, res) {
             envelopeMoves: cleanEnvelopeMoves(incoming.envelopeMoves),
             reserveTxns: cleanReserveTxns(incoming.reserveTxns),
             odometerReadings: cleanOdometerReadings(incoming.odometerReadings),
-            accounts: current.data?.accounts || [],
-            importedTxns: current.data?.importedTxns || [],
-            statementBatches: current.data?.statementBatches || [],
-            monthCloses: current.data?.monthCloses || {},
             weekCloses: cleanWeekCloses(incoming.weekCloses),
           };
         } else {
@@ -1111,8 +963,6 @@ async function handle(req, res) {
             bills: (Array.isArray(incoming.bills) ? incoming.bills : []).map(cleanBill).filter(Boolean),
             billPayments: (Array.isArray(incoming.billPayments) ? incoming.billPayments : []).map(cleanBillPayment).filter(Boolean),
             odometerReadings: cleanOdometerReadings(incoming.odometerReadings),
-            accounts: cleanAccounts(incoming.accounts),
-            importedTxns: cleanImported(incoming.importedTxns),
           }, { deletedIds, deletedCats, undeleteIds });
         }
         await save(next);
