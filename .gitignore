@@ -1,7 +1,19 @@
+node_modules/
+dist/
+.cargo-home/
+.npm-cache/
+.npm-logs/
+src-tauri/target/
+dist-android/
+
 # --- local data (never publish) ---
 data.json
 data.json.tmp
+data*.json
 backups/
+ops.json
+routes.json
+server.log
 
 # --- TLS material: private keys must never be committed ---
 tls/
